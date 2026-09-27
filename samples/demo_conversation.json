@@ -1,0 +1,242 @@
+[
+  {
+    "delay_ms": 1200,
+    "speaker_id": "speaker_1",
+    "speaker_label": "Speaker A (Dr. Rao)",
+    "speaker_color_index": 0,
+    "text": "Welcome everyone. Today we are evaluating the clinical case study of an adolescent exhibiting selective mutism in school settings.",
+    "overlap": false,
+    "overlapping_speakers": [],
+    "prosody": {
+      "rising_intonation": false,
+      "falling_intonation": false,
+      "emphasis": false,
+      "long_pause_before": false,
+      "speech_rate": "normal",
+      "relative_volume": "normal",
+      "mean_pitch_hz": 138.4,
+      "rms_db": -22.1,
+      "words_per_minute": 142.0
+    },
+    "direction": {
+      "angle_degrees": -45.0,
+      "label": "left",
+      "simulated": true,
+      "confidence": 0.90
+    },
+    "confidence": {
+      "transcription": 0.96,
+      "speaker": 0.92
+    }
+  },
+  {
+    "delay_ms": 2200,
+    "speaker_id": "speaker_2",
+    "speaker_label": "Speaker B (Priya)",
+    "speaker_color_index": 1,
+    "text": "Could this pattern be explained primarily by social anxiety disorder rather than oppositional defiance?",
+    "overlap": false,
+    "overlapping_speakers": [],
+    "prosody": {
+      "rising_intonation": true,
+      "falling_intonation": false,
+      "emphasis": false,
+      "long_pause_before": false,
+      "speech_rate": "normal",
+      "relative_volume": "normal",
+      "mean_pitch_hz": 218.6,
+      "rms_db": -20.8,
+      "words_per_minute": 156.0
+    },
+    "direction": {
+      "angle_degrees": 0.0,
+      "label": "front",
+      "simulated": true,
+      "confidence": 0.88
+    },
+    "confidence": {
+      "transcription": 0.94,
+      "speaker": 0.91
+    }
+  },
+  {
+    "delay_ms": 2000,
+    "speaker_id": "speaker_1",
+    "speaker_label": "Speaker A (Dr. Rao)",
+    "speaker_color_index": 0,
+    "text": "That is an insightful differential diagnosis, Priya. Notice the symptoms are strictly situational.",
+    "overlap": false,
+    "overlapping_speakers": [],
+    "prosody": {
+      "rising_intonation": false,
+      "falling_intonation": false,
+      "emphasis": false,
+      "long_pause_before": false,
+      "speech_rate": "normal",
+      "relative_volume": "normal",
+      "mean_pitch_hz": 142.1,
+      "rms_db": -21.4,
+      "words_per_minute": 148.0
+    },
+    "direction": {
+      "angle_degrees": -45.0,
+      "label": "left",
+      "simulated": true,
+      "confidence": 0.92
+    },
+    "confidence": {
+      "transcription": 0.98,
+      "speaker": 0.95
+    }
+  },
+  {
+    "delay_ms": 1800,
+    "speaker_id": "speaker_1",
+    "speaker_label": "Speaker A (Dr. Rao)",
+    "speaker_color_index": 0,
+    "text": "When reviewing the behavioral observation logs—",
+    "overlap": true,
+    "overlapping_speakers": ["Speaker B (Priya)"],
+    "prosody": {
+      "rising_intonation": false,
+      "falling_intonation": false,
+      "emphasis": false,
+      "long_pause_before": false,
+      "speech_rate": "normal",
+      "relative_volume": "normal",
+      "mean_pitch_hz": 140.0,
+      "rms_db": -21.8,
+      "words_per_minute": 150.0
+    },
+    "direction": {
+      "angle_degrees": -45.0,
+      "label": "left",
+      "simulated": true,
+      "confidence": 0.91
+    },
+    "confidence": {
+      "transcription": 0.95,
+      "speaker": 0.89
+    }
+  },
+  {
+    "delay_ms": 600,
+    "speaker_id": "speaker_2",
+    "speaker_label": "Speaker B (Priya)",
+    "speaker_color_index": 1,
+    "text": "—specifically during unstructured lunch periods where verbal participation was zero—",
+    "overlap": true,
+    "overlapping_speakers": ["Speaker A (Dr. Rao)"],
+    "prosody": {
+      "rising_intonation": false,
+      "falling_intonation": false,
+      "emphasis": true,
+      "long_pause_before": false,
+      "speech_rate": "fast",
+      "relative_volume": "loud",
+      "mean_pitch_hz": 235.0,
+      "rms_db": -16.2,
+      "words_per_minute": 182.0
+    },
+    "direction": {
+      "angle_degrees": 0.0,
+      "label": "front",
+      "simulated": true,
+      "confidence": 0.87
+    },
+    "confidence": {
+      "transcription": 0.93,
+      "speaker": 0.86
+    }
+  },
+  {
+    "delay_ms": 2800,
+    "speaker_id": "speaker_3",
+    "speaker_label": "Speaker C (Arjun)",
+    "speaker_color_index": 2,
+    "text": "The psychological evaluation also reported severe physiological arousal whenever called upon in class.",
+    "overlap": false,
+    "overlapping_speakers": [],
+    "prosody": {
+      "rising_intonation": false,
+      "falling_intonation": false,
+      "emphasis": true,
+      "long_pause_before": true,
+      "speech_rate": "normal",
+      "relative_volume": "normal",
+      "mean_pitch_hz": 115.3,
+      "rms_db": -22.5,
+      "words_per_minute": 136.0
+    },
+    "direction": {
+      "angle_degrees": 45.0,
+      "label": "right",
+      "simulated": true,
+      "confidence": 0.89
+    },
+    "confidence": {
+      "transcription": 0.97,
+      "speaker": 0.93
+    }
+  },
+  {
+    "delay_ms": 2400,
+    "speaker_id": "speaker_2",
+    "speaker_label": "Speaker B (Priya)",
+    "speaker_color_index": 1,
+    "text": "So a stimulus fading and contingency management plan would be the most effective intervention here?",
+    "overlap": false,
+    "overlapping_speakers": [],
+    "prosody": {
+      "rising_intonation": true,
+      "falling_intonation": false,
+      "emphasis": false,
+      "long_pause_before": false,
+      "speech_rate": "fast",
+      "relative_volume": "normal",
+      "mean_pitch_hz": 224.2,
+      "rms_db": -20.1,
+      "words_per_minute": 168.0
+    },
+    "direction": {
+      "angle_degrees": 0.0,
+      "label": "front",
+      "simulated": true,
+      "confidence": 0.90
+    },
+    "confidence": {
+      "transcription": 0.96,
+      "speaker": 0.94
+    }
+  },
+  {
+    "delay_ms": 2200,
+    "speaker_id": "speaker_1",
+    "speaker_label": "Speaker A (Dr. Rao)",
+    "speaker_color_index": 0,
+    "text": "Precisely. That protocol has the strongest empirical support in literature.",
+    "overlap": false,
+    "overlapping_speakers": [],
+    "prosody": {
+      "rising_intonation": false,
+      "falling_intonation": true,
+      "emphasis": false,
+      "long_pause_before": false,
+      "speech_rate": "normal",
+      "relative_volume": "normal",
+      "mean_pitch_hz": 134.0,
+      "rms_db": -23.0,
+      "words_per_minute": 132.0
+    },
+    "direction": {
+      "angle_degrees": -45.0,
+      "label": "left",
+      "simulated": true,
+      "confidence": 0.95
+    },
+    "confidence": {
+      "transcription": 0.99,
+      "speaker": 0.96
+    }
+  }
+]

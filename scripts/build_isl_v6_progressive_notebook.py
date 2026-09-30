@@ -59,7 +59,7 @@ def check_canonicalization_fixture() -> None:
 
 
 SETUP = r'''# Environment only: this experiment consumes mounted artifacts and cached poses; it never downloads pose data.
-import gc, hashlib, json, math, os, random, shutil, sys, time
+import gc, hashlib, json, math, os, random, shutil, sys, time, zipfile
 from pathlib import Path
 from collections import defaultdict
 
@@ -99,6 +99,24 @@ print('No Hugging Face token or pose-network access is used; only public MiniLM 
 LOAD_V5_AND_POSES = r'''# Load the exact V5 cohort/checkpoint and rebuild only from attached raw caches.
 V5_MANIFEST_NAME = 'manifest_minilm_position_motion_v5.json'
 manifest_paths = sorted(INPUT_ROOT.rglob(V5_MANIFEST_NAME))
+if not manifest_paths:
+    artifact_zips = sorted(INPUT_ROOT.rglob('hackcessible_isl_v5_artifacts.zip'))
+    if len(artifact_zips) != 1:
+        raise RuntimeError(
+            f'Expected the V5 artifact tree or exactly one hackcessible_isl_v5_artifacts.zip; found {len(artifact_zips)} ZIPs.'
+        )
+    artifact_sha = hashlib.sha256(artifact_zips[0].read_bytes()).hexdigest().upper()
+    extracted_root = WORK_ROOT / f'v5_artifacts_{artifact_sha[:12]}'
+    extracted_root.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(artifact_zips[0], 'r') as archive:
+        members = archive.infolist()
+        for member in members:
+            member_path = Path(member.filename)
+            if member_path.is_absolute() or '..' in member_path.parts:
+                raise RuntimeError(f'Unsafe path in attached V5 artifact ZIP: {member.filename}')
+        archive.extractall(extracted_root)
+    manifest_paths = sorted(extracted_root.rglob(V5_MANIFEST_NAME))
+    print('Extracted attached V5 artifact ZIP:', artifact_zips[0], '| SHA256:', artifact_sha)
 if len(manifest_paths) != 1:
     raise RuntimeError(
         f'Expected exactly one attached V5 artifact manifest named {V5_MANIFEST_NAME}; '
@@ -107,6 +125,55 @@ if len(manifest_paths) != 1:
 V5_MANIFEST_PATH = manifest_paths[0]
 V5_ROOT = V5_MANIFEST_PATH.parent
 manifest = json.loads(V5_MANIFEST_PATH.read_text(encoding='utf-8'))
+V5_METRICS_PATH = V5_ROOT / 'metrics_summary.json'
+V5_SELECTION_PATH = V5_ROOT / 'selection_manifest_predecode.json'
+if not V5_METRICS_PATH.is_file() or not V5_SELECTION_PATH.is_file():
+    raise RuntimeError('V5 metrics_summary.json and selection_manifest_predecode.json are required for raw-cache coverage and exclusion audits.')
+v5_metrics = json.loads(V5_METRICS_PATH.read_text(encoding='utf-8'))
+v5_selection = json.loads(V5_SELECTION_PATH.read_text(encoding='utf-8'))
+fresh_train_selected_records = list(v5_selection['fresh_train'])
+fresh_test_selected_records = list(v5_selection['fresh_test'])
+fresh_train_selected_uids = [str(row['uid']) for row in fresh_train_selected_records]
+fresh_test_selected_uids = [str(row['uid']) for row in fresh_test_selected_records]
+fresh_selected_uids = fresh_train_selected_uids + fresh_test_selected_uids
+fresh_train_selected_uid_set = set(fresh_train_selected_uids)
+fresh_test_selected_uid_set = set(fresh_test_selected_uids)
+assert len(fresh_train_selected_uids) == int(v5_metrics['fresh_train_rows_selected']) == 8000
+assert len(fresh_test_selected_uids) == int(v5_metrics['fresh_test_rows_selected']) == 500
+assert len(set(fresh_selected_uids)) == len(fresh_selected_uids) == 8500, 'V5 predecode selection must contain exactly 8,500 unique fresh UIDs.'
+assert float(v5_selection.get('minimum_fresh_coverage', 0.0)) >= 0.98
+fresh_selected_uid_set = set(fresh_selected_uids)
+v5_exclusions = list(v5_metrics.get('load_and_canonicalization_exclusions', []))
+fresh_decode_failure_uids = {
+    str(row['uid']) for row in v5_exclusions
+    if str(row.get('reason', '')).startswith('fresh_pose_decode_error:')
+}
+fresh_selection_by_uid = {str(row['uid']): row for row in fresh_train_selected_records + fresh_test_selected_records}
+fresh_exclusion_by_uid = {str(row['uid']): row for row in v5_exclusions if str(row.get('uid')) in fresh_selected_uid_set}
+assert fresh_decode_failure_uids.issubset(fresh_selected_uid_set), 'A logged fresh decode failure is outside the fixed predecode roster.'
+v5_exclusion_anchor_accounting = []
+for row in v5_exclusions:
+    frames = int(row.get('resampled_frame_count') or TMAX)
+    direct = int(row.get('direct_anchor_frames') or 0)
+    fallback = int(row.get('fallback_anchor_frames') or 0)
+    interpolated = int(row.get('interpolated_anchor_frames') or 0)
+    unresolved = int(row.get('unresolved_anchor_frames') or 0)
+    reason = str(row.get('reason', ''))
+    rejected = row.get('anchor_mode') == 'unusable' or 'fewer_than_two_reliable' in reason or reason.startswith('fresh_pose_decode_error:') or reason.startswith('selected_v2_pose_missing') or reason.startswith('selected_v2_cache_error:')
+    record = dict(row)
+    record.update({
+        'observed_anchor_frames': direct + fallback,
+        'canonicalized_output_frames': 0 if rejected else max(0, frames - unresolved),
+        'clip_rejected': bool(rejected),
+        'logged_unresolved_frames_semantics': 'clip-level rejected/unavailable coverage; may overlap observed direct/fallback anchor counts' if rejected else 'unresolved frames in accepted clip',
+        'anchor_counts_form_disjoint_frame_partition': not rejected,
+    })
+    if rejected:
+        assert unresolved == frames, f'Rejected V5 clip {row.get("uid")} must retain its full clip-level unresolved count.'
+        assert direct + fallback == int(row.get('total_anchor_frames') or 0), f'Observed-anchor counts disagree for rejected V5 clip {row.get("uid")}.'
+    else:
+        assert direct + fallback + interpolated + unresolved == frames, f'Accepted V5 anchor counts do not partition frames for {row.get("uid")}.'
+    v5_exclusion_anchor_accounting.append(record)
 assert manifest.get('model_arm') == 'minilm_position_motion_v5', f'Unexpected V5 model arm: {manifest.get("model_arm")}'
 assert manifest.get('evaluation_status') and manifest.get('comparison_design'), 'V5 evaluation provenance is missing.'
 print('V6 treats the inherited V5 cohort as development evidence, regardless of the V5 label wording.')
@@ -164,6 +231,27 @@ stop_caption_keys = {caption_key(train_by_uid[uid]) for uid in early_uids}
 test_caption_keys = {caption_key(row) for row in test_records}
 assert fit_caption_keys.isdisjoint(stop_caption_keys | test_caption_keys), 'V5 manifest has caption leakage into the fit set.'
 assert stop_caption_keys.isdisjoint(test_caption_keys), 'V5 inner-stop captions overlap the paired test captions.'
+v5_unassigned_train_uids = sorted(set(train_by_uid) - set(fit_uids) - set(early_uids))
+v5_unassigned_train_rows = []
+for uid in v5_unassigned_train_uids:
+    row = train_by_uid[uid]
+    key = caption_key(row)
+    if key in stop_caption_keys:
+        reason = 'excluded_from_fit_by_normalized_caption_overlap_with_v5_inner_stop'
+    elif key in test_caption_keys:
+        reason = 'excluded_from_fit_by_normalized_caption_overlap_with_v5_validation'
+    else:
+        raise RuntimeError(f'V5 effective train UID has no fit/stop role and no caption exclusion reason: {uid}')
+    v5_unassigned_train_rows.append({
+        'uid': uid, 'source_video_id': row.get('source_video_id'),
+        'source_aliases': row.get('source_aliases', []), 'text': row.get('text'),
+        'normalized_caption_key': key, 'source_video_cluster': row.get('source_video_cluster'),
+        'reason': reason,
+    })
+assert len(fit_uids) + len(early_uids) + len(v5_unassigned_train_rows) == len(train_records)
+print('V5 effective train role accounting:', len(fit_uids), 'fit +', len(early_uids),
+      'inner stop +', len(v5_unassigned_train_rows), 'caption-held-out rows =', len(train_records))
+print('Caption-held-out train UIDs:', [row['uid'] for row in v5_unassigned_train_rows])
 
 checkpoint_paths = sorted(V5_ROOT.rglob('minilm_position_motion_v5.pt'))
 if len(checkpoint_paths) != 1:
@@ -214,6 +302,61 @@ if not v2_cache_dirs or not v5_cache_dirs:
         '(directory isign_pose_cache_v5). V6 never re-decodes pose data from the network.'
     )
 cache_dirs = v2_cache_dirs + v5_cache_dirs
+fresh_cache_path_lists = defaultdict(list)
+for cache_dir in v5_cache_dirs:
+    for path in cache_dir.glob('*.npz'):
+        fresh_cache_path_lists[path.stem].append(path)
+duplicate_fresh_cache_uids = sorted(uid for uid, paths in fresh_cache_path_lists.items() if len(paths) != 1)
+if duplicate_fresh_cache_uids:
+    raise RuntimeError(f'Fresh cache has duplicate UID files across attached inputs: {duplicate_fresh_cache_uids[:20]}')
+fresh_cache_uids = set(fresh_cache_path_lists)
+unexpected_fresh_cache_uids = sorted(fresh_cache_uids - fresh_selected_uid_set)
+missing_fresh_cache_uids = sorted(fresh_selected_uid_set - fresh_cache_uids)
+missing_without_logged_failure_uids = sorted(set(missing_fresh_cache_uids) - fresh_decode_failure_uids)
+cache_for_logged_failure_uids = sorted(fresh_cache_uids & fresh_decode_failure_uids)
+missing_fresh_cache_records = []
+for uid in missing_fresh_cache_uids:
+    selection_row = fresh_selection_by_uid[uid]
+    exclusion_row = fresh_exclusion_by_uid.get(uid, {})
+    missing_fresh_cache_records.append({
+        'uid': uid,
+        'selected_side': 'fresh_train' if uid in fresh_train_selected_uid_set else 'fresh_test',
+        'source_video_id': selection_row.get('source_video_id'),
+        'source_aliases': selection_row.get('source_aliases', []),
+        'text': selection_row.get('text'),
+        'reason': exclusion_row.get('reason', 'raw_cache_file_missing_without_v5_logged_decode_failure'),
+    })
+fresh_train_cache_coverage = len(fresh_train_selected_uid_set & fresh_cache_uids) / len(fresh_train_selected_uids)
+fresh_test_cache_coverage = len(fresh_test_selected_uid_set & fresh_cache_uids) / len(fresh_test_selected_uids)
+fresh_cache_audit = {
+    'predecode_selection_manifest_sha256': hashlib.sha256(V5_SELECTION_PATH.read_bytes()).hexdigest().upper(),
+    'selected_fresh_train_uids': len(fresh_train_selected_uids), 'selected_fresh_test_uids': len(fresh_test_selected_uids),
+    'selected_fresh_uid_count': len(fresh_selected_uids),
+    'selected_fresh_uid_order_sha256': hashlib.sha256('\n'.join(fresh_selected_uids).encode()).hexdigest(),
+    'raw_cache_uid_count': len(fresh_cache_uids), 'raw_cache_train_coverage': fresh_train_cache_coverage,
+    'raw_cache_test_coverage': fresh_test_cache_coverage, 'minimum_coverage': 0.98,
+    'logged_decode_failure_uids': sorted(fresh_decode_failure_uids),
+    'missing_selected_uids': missing_fresh_cache_uids,
+    'missing_uids_without_logged_decode_failure': missing_without_logged_failure_uids,
+    'missing_uid_records': missing_fresh_cache_records,
+    'unexpected_raw_cache_uids': unexpected_fresh_cache_uids,
+    'raw_cache_present_for_logged_decode_failures': cache_for_logged_failure_uids,
+}
+if (len(fresh_train_selected_uids), len(fresh_test_selected_uids), len(fresh_selected_uids)) != (8000, 500, 8500):
+    raise RuntimeError(f'Unexpected frozen V5 predecode roster: {len(fresh_train_selected_uids)} train / {len(fresh_test_selected_uids)} test.')
+if unexpected_fresh_cache_uids or cache_for_logged_failure_uids:
+    raise RuntimeError(
+        'V5 raw fresh cache contains UIDs outside the frozen roster or files for logged decode failures. '
+        f'unexpected={len(unexpected_fresh_cache_uids)} {unexpected_fresh_cache_uids[:12]}, '
+        f'cached logged failures={cache_for_logged_failure_uids[:12]}'
+    )
+if fresh_train_cache_coverage < 0.98 or fresh_test_cache_coverage < 0.98:
+    raise RuntimeError(f'Fresh raw cache coverage is below 98%: train={fresh_train_cache_coverage:.3%}, test={fresh_test_cache_coverage:.3%}; no reselection is allowed.')
+if missing_without_logged_failure_uids:
+    print('Fresh cache has UIDs absent without a logged V5 decode failure; they are recorded as unavailable and never replaced:',
+          len(missing_without_logged_failure_uids), missing_without_logged_failure_uids[:20])
+print('Fresh cache preflight:', len(fresh_cache_uids), '/ 8,500 selected UIDs; train coverage',
+      f'{fresh_train_cache_coverage:.2%}, test coverage {fresh_test_cache_coverage:.2%}; expected roster audited.')
 cache_paths_by_uid = defaultdict(list)
 for cache_dir in cache_dirs:
     for path in cache_dir.glob('*.npz'):
@@ -722,6 +865,20 @@ v6_manifest={
     'fit_checkpoint':{'epoch':best_epoch,'free_run_selection_score':best_score,'history':history,'gpus':GPU_NAMES,
                       'gpu_probe':{'teacher_forward_backward_seconds':teacher_probe_seconds,'free_run_batch_seconds':free_probe_seconds,'batch_size':BATCH_SIZE,'free_run_batch_size':len(probe_uids)}},
     'paired_metrics':paired_metrics,'v6_true_text_free_run_metrics':test_true_metrics,'v6_shuffled_text_free_run_metrics':test_shuffle_metrics,
+    'paired_metric_definitions':{
+        'group_balanced_normalized_mse':'position-only term; confidence-weighted per-group normalized coordinate MSE, then group weights from objective',
+        'group_balanced_normalized_velocity_mse':'velocity term; confidence-weighted adjacent-frame normalized velocity MSE, then group weights from objective',
+        'selection_score':'composite = group_balanced_normalized_mse + objective.velocity_coefficient * group_balanced_normalized_velocity_mse',
+    },
+    'v5_fresh_cache_preflight':fresh_cache_audit,
+    'v5_exclusion_anchor_accounting':{
+        'source':'V5 metrics_summary.json load_and_canonicalization_exclusions',
+        'records':v5_exclusion_anchor_accounting,
+        'note':'The source V5 fields direct/fallback are observed reliable anchor-frame counts. For an unusable/rejected clip, unresolved_anchor_frames describes the full rejected output clip and overlaps those observations; these counts do not describe a disjoint 48-frame partition. Raw V5 values are retained verbatim in each record. This audit does not alter any pose, confidence, or training role.',
+    },
+    'v5_train_role_accounting':{'effective_train_rows':len(train_records),'fit_rows':len(fit_uids),'early_stop_rows':len(early_uids),
+        'caption_held_out_rows':len(v5_unassigned_train_rows),'excluded_rows':v5_unassigned_train_rows,
+        'note':'These V5 effective train rows were excluded from both gradient fit and early stop because their normalized caption duplicated an inner-stop or validation caption. V6 preserves these roles and does not resplit or add them back.'},
     'paired_condition_comparisons':[{'name':'V6 vs V5 on frozen development cohort','left_condition':'true_text','right_condition':'v5_model_true','scope':'all_samples'},
                                     {'name':'V6 vs V4 on frozen development cohort','left_condition':'true_text','right_condition':'v4_model_true','scope':'all_samples'}],
     'split':{key:value for key,value in split.items()},
@@ -738,7 +895,9 @@ v6_manifest={
 (EXPORT_ROOT/'manifest_progressive_v6.json').write_text(json.dumps(v6_manifest,indent=2),encoding='utf-8')
 (EXPORT_ROOT/'metrics_summary.json').write_text(json.dumps({
     'selected_epoch':best_epoch,'internal_free_run_selection_score':best_score,'history':history,
-    'test_metrics':paired_metrics,'v6_true_text_free_run':test_true_metrics,'v6_shuffled_text_free_run':test_shuffle_metrics
+    'test_metrics':paired_metrics,'paired_metric_definitions':v6_manifest['paired_metric_definitions'],
+    'v5_fresh_cache_preflight':fresh_cache_audit,'v5_exclusion_anchor_accounting':v6_manifest['v5_exclusion_anchor_accounting'],
+    'v6_true_text_free_run':test_true_metrics,'v6_shuffled_text_free_run':test_shuffle_metrics
 },indent=2),encoding='utf-8')
 checkpoint={'format':'Hackcessible iSign V6 progressive causal decoder','state_dict':best_state,
             'config':signature_payload,'normalizer_mean':v5_mean,'normalizer_std':v5_std,
@@ -759,8 +918,10 @@ readme=(
 archive_path=shutil.make_archive(str(WORK_ROOT/'hackcessible_isl_v6_progressive_artifacts'),'zip',root_dir=EXPORT_ROOT)
 print('V6 export:',archive_path,'bytes=',Path(archive_path).stat().st_size)
 print('V6 true/shuffle objective:',test_true_metrics['selection_score'],test_shuffle_metrics['selection_score'])
-print('Paired V5/V4 true-text position MSE:',paired_metrics['v5_true_text']['group_balanced_normalized_mse'],
+print('Paired V5/V4 group-balanced normalized position MSE (position term only):',paired_metrics['v5_true_text']['group_balanced_normalized_mse'],
       paired_metrics['v4_true_text']['group_balanced_normalized_mse'])
+print('Paired V5/V4 composite position + velocity selection score:',paired_metrics['v5_true_text']['selection_score'],
+      paired_metrics['v4_true_text']['selection_score'])
 '''
 
 

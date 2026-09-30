@@ -210,6 +210,13 @@ selected_v2['source_video_id'] = [
     str(source_id) if supported and str(source_id).strip() else 'unresolved_uid:' + str(uid)
     for source_id, supported, uid in zip(selected_v2['source_video_id'], selected_v2['source_uid_supported'], selected_v2['uid'])
 ]
+selected_v2['source_aliases'] = [
+    sorted(conservative_source_aliases(uid, source_id))
+    for uid, source_id in zip(selected_v2['uid'], selected_v2['source_video_id'])
+]
+required_v2_columns={'uid','text','text_key','source_video_id','source_uid_rule','source_uid_supported','source_aliases'}
+assert required_v2_columns.issubset(selected_v2.columns), f'Legacy V2 roster is missing required audit columns: {sorted(required_v2_columns-set(selected_v2.columns))}'
+assert selected_v2['source_aliases'].map(bool).all(), 'Every V2 UID must have at least one reserved source alias.'
 
 cache_candidates = list(Path('/kaggle/input').rglob('isign_pose_cache_' + run_key))
 assert cache_candidates, 'Attach the verified Hackcessible iSign Pose Cache V2 dataset.'
@@ -220,7 +227,7 @@ selected_v2_uids = set(selected_v2['uid'])
 assert len(cached_by_uid) == 2046 and set(cached_by_uid).issubset(selected_v2_uids), 'V2 cache must be the verified exact 2,046-file roster.'
 old_source_ids = set(selected_v2['source_video_id'])
 old_text_keys = set(selected_v2['text_key'])
-old_source_aliases = set().union(*(conservative_source_aliases(row.uid, row.source_video_id) for row in selected_v2.itertuples()))
+old_source_aliases = set().union(*(set(row.source_aliases) for row in selected_v2.itertuples()))
 old_uid_to_row = selected_v2.set_index('uid').to_dict(orient='index')
 print('Official CSV shape/columns:', metadata.shape, list(metadata.columns))
 print('Source ID provenance:', metadata['source_video_id_provenance'].iloc[0], '| UID parse families:', metadata['source_uid_rule'].value_counts().to_dict())
@@ -285,7 +292,12 @@ fixed_uids=sorted(predecode_test_uids,key=lambda uid:(hashlib.sha256(f'{SEED}:{u
 # Persist the immutable selected roster before any network decoding. Decode failures
 # are recorded against these rows; selections are never silently replaced.
 def selection_record(record):
-    return {'uid':str(record['uid']),'source_video_id':str(record['source_video_id']),'source_aliases':sorted(set(record['source_aliases'])),'source_uid_rule':str(record['source_uid_rule']),'text':str(record['text']),'normalized_caption_key':str(record['text_key'])}
+    aliases=record.get('source_aliases')
+    if not isinstance(aliases,(list,tuple,set,np.ndarray)) or not len(aliases):
+        aliases=conservative_source_aliases(record['uid'],record.get('source_video_id'))
+    if not aliases:
+        raise RuntimeError(f"Selected UID lacks conservative source aliases: {record.get('uid')}")
+    return {'uid':str(record['uid']),'source_video_id':str(record['source_video_id']),'source_aliases':sorted({str(value) for value in aliases}),'source_uid_rule':str(record.get('source_uid_rule','unknown')),'text':str(record['text']),'normalized_caption_key':str(record['text_key'])}
 PREDECODE_SELECTION_PATH=Path('/kaggle/working/isl_v5_selection_manifest_predecode.json')
 PREDECODE_SELECTION_PATH.write_text(json.dumps({'seed':SEED,'v2_run_key':run_key,'fresh_test_rule':'primary UID families only when official video_id is absent; candidate aliases and normalized captions disjoint; deterministic UID hash rank','fresh_train_rule':'source/caption disjoint from reserved V2 and fresh test; deterministic source/UID hash order; max 8 clips per source','minimum_fresh_coverage':FRESH_MIN_COVERAGE,'fixed_unseen_set':{'selection_rule':'sha256_rank_by_uid','uids':fixed_uids},'selected_v2':[selection_record(record) for record in selected_v2.to_dict(orient='records')],'fresh_train':[selection_record(record) for record in fresh_train_rows],'fresh_test':[selection_record(record) for record in fresh_test_rows]},indent=2))
 print('Persisted fixed selection roster before decoding:',PREDECODE_SELECTION_PATH,'| rows:',V2_LIMIT+FRESH_TRAIN_TARGET+FRESH_TEST_TARGET)

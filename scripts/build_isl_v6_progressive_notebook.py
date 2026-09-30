@@ -91,7 +91,22 @@ torch.backends.cudnn.benchmark = True
 assert torch.cuda.is_available() and torch.cuda.device_count() >= 2, 'Select Kaggle GPU T4 x2 before running.'
 GPU_NAMES = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
 device = torch.device('cuda:0')
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_math_sdp(True)
+if hasattr(torch.backends.cuda, 'enable_cudnn_sdp'):
+    torch.backends.cuda.enable_cudnn_sdp(False)
+torch.backends.cuda.matmul.allow_tf32 = False
+ATTENTION_BACKEND_CONFIG = {
+    'scaled_dot_product_attention': 'math_only', 'flash': torch.backends.cuda.flash_sdp_enabled(),
+    'memory_efficient': torch.backends.cuda.mem_efficient_sdp_enabled(),
+    'math': torch.backends.cuda.math_sdp_enabled(),
+    'cudnn': torch.backends.cuda.cudnn_sdp_enabled() if hasattr(torch.backends.cuda, 'cudnn_sdp_enabled') else None,
+    'tf32': torch.backends.cuda.matmul.allow_tf32, 'model_dtype': 'float32',
+}
+assert ATTENTION_BACKEND_CONFIG['math'] and not ATTENTION_BACKEND_CONFIG['flash'] and not ATTENTION_BACKEND_CONFIG['memory_efficient']
 print('V6 environment:', torch.__version__, '| GPUs:', GPU_NAMES, '| device:', device)
+print('V6 attention backend and precision:', ATTENTION_BACKEND_CONFIG)
 print('No Hugging Face token or pose-network access is used; only public MiniLM weights may be downloaded.')
 '''
 
@@ -638,6 +653,9 @@ class ParallelDecoder(nn.Module):
         if mode == 'teacher':
             if target_pose is None: raise ValueError('Teacher mode requires target poses.')
             return self.decoder.forward_teacher(text_hidden, text_mask, target_pose)
+        if mode == 'generate_probe':
+            if target_pose is not None: raise ValueError('Free-run mode must not receive target poses.')
+            return self.decoder.generate(text_hidden, text_mask, frames=TMAX, debug_synchronize_each_frame=True)
         if mode == 'generate':
             if target_pose is not None: raise ValueError('Free-run mode must not receive target poses.')
             return self.decoder.generate(text_hidden, text_mask, frames=TMAX)
@@ -645,7 +663,8 @@ class ParallelDecoder(nn.Module):
 
 decoder_core = ProgressivePoseDecoder(text_dim=384, model_dim=256, num_heads=8, num_layers=2,
                                       feedforward_dim=1024, dropout=0.1, max_frames=TMAX,
-                                      points=POINTS, coordinates=COORDS).to(device)
+                                      points=POINTS, coordinates=COORDS).to(device=device, dtype=torch.float32)
+assert all(parameter.dtype == torch.float32 for parameter in decoder_core.parameters())
 parallel = nn.DataParallel(ParallelDecoder(decoder_core), device_ids=[0, 1])
 
 # Verify both GPUs and target-free inference with a measured in-notebook probe.
@@ -667,19 +686,30 @@ probe_loss.backward()
 probe_grad=torch.nn.utils.clip_grad_norm_(parallel.parameters(),1.0)
 assert torch.isfinite(probe_grad) and float(probe_grad)>0
 optimizer.zero_grad(set_to_none=True)
+for gpu_ix in range(torch.cuda.device_count()): torch.cuda.synchronize(gpu_ix)
 teacher_probe_seconds=time.perf_counter()-t0
 parallel.eval()
 t0=time.perf_counter()
 with torch.inference_mode():
+    free_probe_debug=parallel(probe_h,probe_m,None,'generate_probe')
+for gpu_ix in range(torch.cuda.device_count()): torch.cuda.synchronize(gpu_ix)
+free_probe_debug_seconds=time.perf_counter()-t0
+t0=time.perf_counter()
+with torch.inference_mode():
     free_probe=parallel(probe_h,probe_m,None,'generate')
+for gpu_ix in range(torch.cuda.device_count()): torch.cuda.synchronize(gpu_ix)
 free_probe_seconds=time.perf_counter()-t0
 hook.remove()
+assert free_probe_debug.shape == probe_y.shape and torch.isfinite(free_probe_debug).all()
 assert free_probe.shape == probe_y.shape and torch.isfinite(free_probe).all()
+assert torch.allclose(free_probe_debug, free_probe, atol=1e-6, rtol=1e-6), 'Synchronized diagnostic and standard free-run output differ.'
 assert {0,1}.issubset(seen_devices), f'Two-GPU forward/backward probe failed; devices seen={sorted(seen_devices)}'
 train_batches=math.ceil(len(fit_uids)/BATCH_SIZE)
 stop_batches=math.ceil(len(early_uids)/FREE_RUN_BATCH)
-print('T4x2 probe passed:', tuple(probe_pred.shape), '| grad norm',round(float(probe_grad),5),
-      '| teacher forward/backward seconds',round(teacher_probe_seconds,2),'| 48-frame free-run seconds',round(free_probe_seconds,2))
+print('T4x2 FP32/math-SDPA probe passed:', tuple(probe_pred.shape), '| grad norm',round(float(probe_grad),5),
+      '| teacher forward/backward seconds',round(teacher_probe_seconds,2),
+      '| synchronized free-run probe seconds',round(free_probe_debug_seconds,2),
+      '| standard 48-frame free-run seconds',round(free_probe_seconds,2))
 print('Measured rough epoch estimate: teacher fit',
       round(train_batches*teacher_probe_seconds,1),'sec + free-run stop',
       round(stop_batches*free_probe_seconds,1),'sec; batch/length variability makes this approximate.')
@@ -863,7 +893,8 @@ v6_manifest={
     'tokenization':{'max_length':LMAX_TOKENS,'truncation':'longest_first','ragged_cache_dtype':'float16','ragged_cache_shape':list(token_hidden.shape),'unique_text_count':len(all_texts),'text_sha256':texts_sha256},
     'model_config':{'model_dim':256,'num_heads':8,'num_layers':2,'feedforward_dim':1024,'dropout':0.1,'decoder':'causal autoregressive TransformerDecoder cross-attending to frozen text token states','teacher_forcing':'BOS followed by target poses shifted right by one frame','selection_and_inference':'48-frame free run; target poses are not passed to generate'},
     'fit_checkpoint':{'epoch':best_epoch,'free_run_selection_score':best_score,'history':history,'gpus':GPU_NAMES,
-                      'gpu_probe':{'teacher_forward_backward_seconds':teacher_probe_seconds,'free_run_batch_seconds':free_probe_seconds,'batch_size':BATCH_SIZE,'free_run_batch_size':len(probe_uids)}},
+                      'attention_backend':ATTENTION_BACKEND_CONFIG,
+                      'gpu_probe':{'teacher_forward_backward_seconds':teacher_probe_seconds,'synchronized_free_run_seconds':free_probe_debug_seconds,'free_run_batch_seconds':free_probe_seconds,'batch_size':BATCH_SIZE,'free_run_batch_size':len(probe_uids)}},
     'paired_metrics':paired_metrics,'v6_true_text_free_run_metrics':test_true_metrics,'v6_shuffled_text_free_run_metrics':test_shuffle_metrics,
     'paired_metric_definitions':{
         'group_balanced_normalized_mse':'position-only term; confidence-weighted per-group normalized coordinate MSE, then group weights from objective',

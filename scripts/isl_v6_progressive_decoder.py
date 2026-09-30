@@ -115,7 +115,14 @@ class ProgressivePoseDecoder(nn.Module):
             raise ValueError("Every text example must contain at least one unmasked token")
         hidden = text_hidden.to(dtype=self.text_projection.weight.dtype)
         memory = self.text_norm(self.text_projection(hidden))
-        return memory, ~mask
+        # Use an additive float mask with the same blocked positions. This
+        # avoids PyTorch's bool-to-float mask canonicalization in CUDA MHA.
+        memory_padding_bias = torch.where(
+            mask,
+            torch.zeros((), dtype=memory.dtype, device=memory.device),
+            torch.full((), float("-inf"), dtype=memory.dtype, device=memory.device),
+        ).contiguous()
+        return memory, memory_padding_bias
 
     def _progress(self, batch: int, frames: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if not 1 <= frames <= self.max_frames:
@@ -141,11 +148,16 @@ class ProgressivePoseDecoder(nn.Module):
         decoder_inputs = self.pose_projection(pose_inputs) + self.progress_projection(progress)
         decoder_inputs = self.input_dropout(decoder_inputs)
 
-        # Boolean True entries are blocked by PyTorch's Transformer mask API.
-        causal_mask = torch.triu(
+        # Float masks are additive attention biases: 0 allows and -inf blocks.
+        causal_blocked = torch.triu(
             torch.ones((frames, frames), dtype=torch.bool, device=pose_inputs.device),
             diagonal=1,
         )
+        causal_mask = torch.where(
+            causal_blocked,
+            torch.full((), float("-inf"), dtype=pose_inputs.dtype, device=pose_inputs.device),
+            torch.zeros((), dtype=pose_inputs.dtype, device=pose_inputs.device),
+        ).contiguous()
         decoded = self.decoder(
             tgt=decoder_inputs,
             memory=memory,
@@ -193,6 +205,7 @@ class ProgressivePoseDecoder(nn.Module):
         text_hidden: torch.Tensor,
         text_mask: torch.Tensor,
         frames: Optional[int] = None,
+        debug_synchronize_each_frame: bool = False,
     ) -> torch.Tensor:
         """Generate a full sequence using only BOS and prior model outputs.
 
@@ -207,11 +220,26 @@ class ProgressivePoseDecoder(nn.Module):
             raise ValueError(f"frames must be in [1, {self.max_frames}]")
         batch = text_hidden.shape[0]
         memory, memory_padding_mask = self._validate_text(text_hidden, text_mask)
+        if debug_synchronize_each_frame and memory.is_cuda:
+            try:
+                torch.cuda.synchronize(memory.device)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"CUDA synchronization failed after text-mask preparation on {memory.device}"
+                ) from exc
         pose_inputs = self.start_pose.expand(batch, -1, -1)
         generated = []
-        for _ in range(frame_count):
+        for frame_index in range(frame_count):
             flat_prefix = self._decode_prefix(memory, memory_padding_mask, pose_inputs)
             next_pose = flat_prefix[:, -1:, :]
+            if debug_synchronize_each_frame and next_pose.is_cuda:
+                try:
+                    torch.cuda.synchronize(next_pose.device)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"CUDA synchronization failed during autoregressive frame "
+                        f"{frame_index + 1}/{frame_count} on {next_pose.device}"
+                    ) from exc
             generated.append(next_pose[:, 0])
             if len(generated) < frame_count:
                 pose_inputs = torch.cat((pose_inputs, next_pose), dim=1)

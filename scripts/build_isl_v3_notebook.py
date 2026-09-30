@@ -245,12 +245,23 @@ assert hashlib.sha256('|'.join(selected['uid']).encode()).hexdigest()[:12] == ru
 assert cache_is_exact_roster is False or set(rows['uid']) == cached_uid_set
 print('Loaded exact V2 roster:', len(rows), '| 2,046 expected | skipped:', dict(skipped))
 """),
-    code(r"""# Canonicalize the official 75-point body-and-hands representation and preserve the V2 split.
+    code(r"""# Canonicalize body and hands, preserving the original V2 split before exclusions.
 POINT_INDICES = np.asarray(list(range(33)) + list(range(501, 543)), dtype=np.int64)
 assert len(POINT_INDICES) == 75 and len(set(POINT_INDICES.tolist())) == 75
 TMAX, POINTS = 48, 75
+MIN_ANCHOR_CONF = 0.15
 
-def canonicalize_one(raw_pose, raw_confidence, min_anchor_conf=0.15):
+# Freeze the exact V2 partition over all cached examples before canonicalization.
+original_rows = rows.copy().reset_index(drop=True)
+original_permutation = np.random.default_rng(SEED).permutation(len(original_rows))
+original_val_count = max(1, int(round(len(original_rows) * 0.10)))
+original_val_ix = original_permutation[:original_val_count]
+original_train_ix = original_permutation[original_val_count:]
+assert len(original_train_ix) == 1841 and len(original_val_ix) == 205
+original_split_by_index = {int(i): 'validation' for i in original_val_ix}
+original_split_by_index.update({int(i): 'train' for i in original_train_ix})
+
+def canonicalize_one(raw_pose, raw_confidence, min_anchor_conf=MIN_ANCHOR_CONF):
     raw_pose = np.asarray(raw_pose, dtype=np.float32)
     raw_confidence = np.asarray(raw_confidence, dtype=np.float32)
     valid_coords = np.isfinite(raw_pose).all(axis=-1)
@@ -264,7 +275,29 @@ def canonicalize_one(raw_pose, raw_confidence, min_anchor_conf=0.15):
     anchors_ok = (point_conf[:, 0] >= min_anchor_conf) & (point_conf[:, 11] >= min_anchor_conf) & (point_conf[:, 12] >= min_anchor_conf)
     anchors_ok &= valid_coords[:, 0] & valid_coords[:, 11] & valid_coords[:, 12] & np.isfinite(scale) & (scale > 1e-4)
     good = np.flatnonzero(anchors_ok)
-    if len(good) < 2: return None
+    anchor_names = {'nose': 0, 'left_shoulder': 11, 'right_shoulder': 12}
+    finite_anchor_counts = {name: int(valid_coords[:, point].sum()) for name, point in anchor_names.items()}
+    confident_anchor_counts = {
+        name: int((valid_coords[:, point] & (point_conf[:, point] >= min_anchor_conf)).sum())
+        for name, point in anchor_names.items()
+    }
+    anchor_info = {
+        'anchor_mode': 'nose_both_shoulders',
+        'threshold': float(min_anchor_conf),
+        'finite_anchor_counts': finite_anchor_counts,
+        'confident_anchor_counts': confident_anchor_counts,
+        'primary_scale_valid_count': int(len(good)),
+        'direct_anchor_frames': int(len(good)),
+        'fallback_anchor_frames': 0,
+        'interpolated_anchor_frames': 0,
+        'unresolved_anchor_frames': int(TMAX),
+        'total_anchor_frames': int(len(good)),
+        'resampled_frame_count': int(raw_pose.shape[0]),
+    }
+    if len(good) < 2:
+        anchor_info['anchor_mode'] = 'unusable'
+        anchor_info['reason'] = 'fewer_than_two_reliable_nose_and_both_shoulder_frames'
+        return None, None, anchor_info
     frame_ix = np.arange(raw_pose.shape[0])
     center_interp = np.stack([np.interp(frame_ix, good, center[good, axis]) for axis in range(3)], axis=-1)
     scale_interp = np.exp(np.interp(frame_ix, good, np.log(scale[good].clip(1e-4))))
@@ -272,30 +305,50 @@ def canonicalize_one(raw_pose, raw_confidence, min_anchor_conf=0.15):
     canonical = (selected_pose - center_interp[:, None, :]) / scale_interp[:, None, None]
     selected_conf *= reliability[:, None]
     canonical = np.nan_to_num(canonical, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-    return canonical, selected_conf.astype(np.float32), int(len(raw_pose) - len(good))
+    anchor_info['interpolated_anchor_frames'] = int(raw_pose.shape[0] - len(good))
+    anchor_info['unresolved_anchor_frames'] = 0
+    anchor_info['resampled_frame_count'] = int(raw_pose.shape[0])
+    return canonical, selected_conf.astype(np.float32), anchor_info
 
-canonical_rows, canonical_conf_rows = [], []
-anchor_interpolations = 0
-for pose, confidence in zip(poses, confs):
-    result = canonicalize_one(pose, confidence)
-    if result is None: raise RuntimeError('A V2 cached pose has fewer than two reliable nose/shoulder frames.')
-    canonical, canonical_conf, interpolated = result
-    canonical_rows.append(canonical); canonical_conf_rows.append(canonical_conf); anchor_interpolations += interpolated
+canonical_rows, canonical_conf_rows, kept_original_indices = [], [], []
+canonicalization_by_original_index, canonicalization_exclusions = {}, []
+for original_i, (pose, confidence) in enumerate(zip(poses, confs)):
+    canonical, canonical_conf, anchor_info = canonicalize_one(pose, confidence)
+    if canonical is None:
+        source = original_rows.iloc[original_i]
+        exclusion = {
+            'uid': str(source.uid),
+            'source_video_id': str(source.video_id),
+            'text': str(source.text),
+            'original_split': original_split_by_index[original_i],
+            **anchor_info,
+        }
+        canonicalization_exclusions.append(exclusion)
+        canonicalization_by_original_index[original_i] = anchor_info
+        continue
+    kept_original_indices.append(original_i)
+    canonical_rows.append(canonical); canonical_conf_rows.append(canonical_conf)
+    canonicalization_by_original_index[original_i] = anchor_info
+
+if len(canonicalization_exclusions) != 1 or canonicalization_exclusions[0]['uid'] != '9zQleTPz3oQ--1':
+    raise RuntimeError(f'Unexpected canonicalization exclusions: {[(x["uid"], x["reason"]) for x in canonicalization_exclusions]}')
+old_to_new = {old_i: new_i for new_i, old_i in enumerate(kept_original_indices)}
+outer_train_ix = np.asarray([old_to_new[int(i)] for i in original_train_ix if int(i) in old_to_new], dtype=np.int64)
+val_ix = np.asarray([old_to_new[int(i)] for i in original_val_ix if int(i) in old_to_new], dtype=np.int64)
+rows = original_rows.iloc[kept_original_indices].reset_index(drop=True)
 canonical_poses = np.stack(canonical_rows).astype(np.float32)
 canonical_confs = np.stack(canonical_conf_rows).astype(np.float32)
 del canonical_rows, canonical_conf_rows, poses, confs; gc.collect()
-
-permutation = np.random.default_rng(SEED).permutation(len(rows))
-val_count = max(1, int(round(len(rows) * 0.10)))
-val_ix = permutation[:val_count]; outer_train_ix = permutation[val_count:]
-assert len(outer_train_ix) == 1841 and len(val_ix) == 205
+assert len(rows) == 2045 and len(outer_train_ix) + len(val_ix) == len(rows)
+assert len(outer_train_ix) + len(val_ix) + len(canonicalization_exclusions) == len(original_rows)
 assert set(rows.iloc[outer_train_ix].video_id).isdisjoint(set(rows.iloc[val_ix].video_id))
 assert 'onNSvHmicw0--0' in set(rows.iloc[val_ix].uid.astype(str)), 'Known V2 held-out reference UID is missing.'
 
 token_pattern = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)?|[^\w\s]", re.IGNORECASE)
 def text_key(text): return ' '.join(token_pattern.findall(str(text).lower()))
 
-validation_text_keys = {text_key(rows.iloc[i].text) for i in val_ix}
+# Keep captions from every original validation row held out, including any row excluded from pose fitting.
+validation_text_keys = {text_key(original_rows.iloc[int(i)].text) for i in original_val_ix}
 caption_overlap_ix = [int(i) for i in outer_train_ix if text_key(rows.iloc[i].text) in validation_text_keys]
 train_pool_ix = [int(i) for i in outer_train_ix if text_key(rows.iloc[i].text) not in validation_text_keys]
 grouped_by_text = defaultdict(list)
@@ -313,8 +366,9 @@ assert not ({text_key(rows.iloc[i].text) for i in fit_ix} & validation_text_keys
 assert not ({text_key(rows.iloc[i].text) for i in fit_ix} & early_keys)
 assert set(rows.iloc[fit_ix].video_id).isdisjoint(set(rows.iloc[early_stop_ix].video_id))
 
-print(f'Canonical points: body 0:33, left hand 33:54, right hand 54:75; scale is 2D nose-to-shoulder-midpoint distance in x/y, applied to x/y/z; reliable-anchor frames interpolated={anchor_interpolations}')
-print(f'Outer V2 split: {len(outer_train_ix)} train / {len(val_ix)} final holdout; exact train captions removed={len(caption_overlap_ix)}')
+print(f'Canonical points: body 0:33, left hand 33:54, right hand 54:75; scale is 2D nose-to-shoulder-midpoint distance in x/y, applied to x/y/z.')
+print(f'Canonicalization exclusions: {len(canonicalization_exclusions)}; original split retained: {len(outer_train_ix)} train / {len(val_ix)} validation; exclusions={[(x["uid"],x["original_split"],x["reason"]) for x in canonicalization_exclusions]}')
+print(f'Outer V2 development split: {len(outer_train_ix)} train / {len(val_ix)} validation; exact train captions removed={len(caption_overlap_ix)}')
 print(f'Effective gradient fit: {len(fit_ix)}; text-group early stop: {len(early_stop_ix)}; final holdout remains untouched for model selection.')
 """),
     code(r"""# Fit train-only coordinate statistics, word vocabulary, and frozen MiniLM sentence features.
@@ -596,7 +650,7 @@ Path('/kaggle/working/isl_v3_tiny_overfit.json').write_text(json.dumps(tiny_repo
 print('Tiny diagnostic position loss:', round(tiny_start,5), '->', round(tiny_end,5), '| component motion:', tiny_motion)
 del tiny_model, tiny_core, tiny_opt; gc.collect(); torch.cuda.empty_cache()
 """),
-    code(r"""# Evaluate all 205 unseen videos under true and shuffled text; export model and evaluator bundles.
+    code(r"""# Evaluate all effective held-out videos under true and shuffled text; export model and evaluator bundles.
 EXPORT_ROOT = Path('/kaggle/working/isl_v3_export')
 if EXPORT_ROOT.exists(): shutil.rmtree(EXPORT_ROOT)
 (EXPORT_ROOT / 'references').mkdir(parents=True)
@@ -648,8 +702,8 @@ if header is not None:
     for component in header.get('components', []):
         name = component.get('name', '')
         if name == 'POSE_LANDMARKS': dst_start, source_start, count = 0, 0, 33
-        elif name == 'LEFT_HAND': dst_start, source_start, count = 33, 501, 21
-        elif name == 'RIGHT_HAND': dst_start, source_start, count = 54, 522, 21
+        elif name in {'LEFT_HAND', 'LEFT_HAND_LANDMARKS'}: dst_start, source_start, count = 33, 501, 21
+        elif name in {'RIGHT_HAND', 'RIGHT_HAND_LANDMARKS'}: dst_start, source_start, count = 54, 522, 21
         else: continue
         for a,b in component.get('limbs', []):
             if 0 <= int(a) < count and 0 <= int(b) < count: edges.append((dst_start + int(a), dst_start + int(b)))
@@ -705,16 +759,28 @@ retrieval_uid=[str(rows.iloc[int(i)].uid) for i in retrieval_ix]
 for i,uid in enumerate([str(rows.iloc[int(j)].uid) for j in val_ix]):
     np.save(EXPORT_ROOT / 'baselines' / (safe_names[uid] + '_semantic_retrieval.npy'), retrieval_all[i])
 
+def metadata_record(frame, i):
+    raw_count=frame.iloc[int(i)].raw_frame_count
+    return {'uid':str(frame.iloc[int(i)].uid),'source_video_id':str(frame.iloc[int(i)].video_id),'text':str(frame.iloc[int(i)].text),'raw_frame_count':None if pd.isna(raw_count) else int(raw_count),'resampled_frame_count':TMAX,'resampling_policy':'uniform_linear_48_endpoints_included' if not pd.isna(raw_count) else 'uniform_linear_48_endpoints_included; original_count_unavailable_in_v2_cache'}
+
 def row_record(i):
-    raw_count=rows.iloc[int(i)].raw_frame_count
-    return {'uid':str(rows.iloc[int(i)].uid),'source_video_id':str(rows.iloc[int(i)].video_id),'text':str(rows.iloc[int(i)].text),'raw_frame_count':None if pd.isna(raw_count) else int(raw_count),'resampled_frame_count':TMAX,'resampling_policy':'uniform_linear_48_endpoints_included' if not pd.isna(raw_count) else 'uniform_linear_48_endpoints_included; original_count_unavailable_in_v2_cache'}
+    original_i=int(kept_original_indices[int(i)])
+    record=metadata_record(rows, i)
+    record['canonicalization_anchor_audit']=canonicalization_by_original_index[original_i]
+    return record
+
 outer_train_records=[row_record(i) for i in outer_train_ix]
 outer_val_records=[row_record(i) for i in val_ix]
+original_train_records=[metadata_record(original_rows, i) for i in original_train_ix]
+original_val_records=[metadata_record(original_rows, i) for i in original_val_ix]
+exclusion_counts_by_side={side:dict(Counter(item['reason'] for item in canonicalization_exclusions if item['original_split']==side)) for side in ('train','validation')}
+validation_universe_uids=sorted(str(uid) for uid in rows.iloc[val_ix].uid)
+validation_universe_sha256=hashlib.sha256('\n'.join(validation_universe_uids).encode()).hexdigest()
 early_stop_uids=[str(rows.iloc[int(i)].uid) for i in early_stop_ix]
 training_uids_used=[str(rows.iloc[int(i)].uid) for i in fit_ix]
 topology={'components':[{'name':'body','start':0,'count':33},{'name':'left_hand','start':33,'count':21},{'name':'right_hand','start':54,'count':21}]}
 
-all_metrics={'dataset':'Exploration-Lab/iSign v1.1','run_key':run_key,'usable_examples':len(rows),'outer_train':len(outer_train_ix),'final_validation':len(val_ix),'effective_fit':len(fit_ix),'internal_early_stop':len(early_stop_ix),'removed_exact_train_test_caption_rows':len(caption_overlap_ix),'fixed_qualitative_uids':fixed_uids,'selected_primary_arm':selected_arm,'candidate_selection':'Lowest common internal text-group validation score: group-balanced normalized position MSE + 0.05 times group-balanced normalized velocity MSE; the V2 205-video outer holdout is development evidence because it has been inspected across arms.','counterfactual_text_rule':'For each held-out UID, choose a different normalized caption from the held-out caption set using SHA256(SEED:UID); no final-held-out caption text occurs in the gradient-fit set.','resampling':{'resampled_frame_count':TMAX,'policy':'uniform_linear_48_endpoints_included','raw_frame_count':'Unavailable for original V2 cached examples because the cache contains only already-resampled pose and confidence arrays. Raw count is recorded when ranged fallback decoding exposes it.'},'arms':{},'baselines':{}}
+all_metrics={'dataset':'Exploration-Lab/iSign v1.1','run_key':run_key,'usable_examples':len(rows),'original_cache_examples':len(original_rows),'canonicalization_exclusions':canonicalization_exclusions,'canonicalization_exclusion_counts_by_original_split':exclusion_counts_by_side,'outer_train':len(outer_train_ix),'final_validation':len(val_ix),'effective_fit':len(fit_ix),'internal_early_stop':len(early_stop_ix),'removed_exact_train_test_caption_rows':len(caption_overlap_ix),'fixed_qualitative_uids':fixed_uids,'selected_primary_arm':selected_arm,'candidate_selection':'Lowest common internal text-group validation score: group-balanced normalized position MSE + 0.05 times group-balanced normalized velocity MSE; the V2 outer holdout is development evidence because it has been inspected across arms.','counterfactual_text_rule':'For each held-out UID, choose a different normalized caption from the held-out caption set using SHA256(SEED:UID); no final-held-out caption text occurs in the gradient-fit set.','resampling':{'resampled_frame_count':TMAX,'policy':'uniform_linear_48_endpoints_included','raw_frame_count':'Unavailable for original V2 cached examples because the cache contains only already-resampled pose and confidence arrays. Raw count is recorded when ranged fallback decoding exposes it.'},'arms':{},'baselines':{}}
 all_metrics['baselines']['zero_pose']=export_metrics(np.broadcast_to(zero_pose,(len(val_ix),TMAX,POINTS,3)),reference_all,confidence_all)
 all_metrics['baselines']['train_frame_mean']=export_metrics(np.broadcast_to(train_frame_mean,(len(val_ix),TMAX,POINTS,3)),reference_all,confidence_all)
 all_metrics['baselines']['semantic_nearest_training_clip']=export_metrics(retrieval_all,reference_all,confidence_all)
@@ -734,7 +800,7 @@ for arm_name, run in runs.items():
         true_path=arm_dir / (slug + '_true.npy'); shuffled_path=arm_dir / (slug + '_shuffled.npy')
         np.save(true_path,true_all[j]); np.save(shuffled_path,shuffled_all[j])
         raw_count=rows.iloc[int(idx)].raw_frame_count
-        sample_records.append({'uid':uid,'source_video_id':str(rows.iloc[int(idx)].video_id),'text':str(rows.iloc[int(idx)].text),'counterfactual_text':counter_text,'counterfactual_source_uid':donor_uid,'raw_frame_count':None if pd.isna(raw_count) else int(raw_count),'resampled_frame_count':TMAX,'resampling_policy':'uniform_linear_48_endpoints_included' if not pd.isna(raw_count) else 'uniform_linear_48_endpoints_included; original_count_unavailable_in_v2_cache','semantic_retrieval_source_uid':retrieval_uid[j],'reference':{'path':'references/' + slug + '.npz','pose_key':'pose','confidence_key':'confidence'},'predictions':{'true_text':'predictions/' + arm_name + '/' + slug + '_true.npy','shuffled_text':'predictions/' + arm_name + '/' + slug + '_shuffled.npy','zero_pose':'baselines/zero_pose.npy','train_frame_mean':'baselines/train_frame_mean.npy','semantic_retrieval':'baselines/' + slug + '_semantic_retrieval.npy'}})
+        sample_records.append({'uid':uid,'source_video_id':str(rows.iloc[int(idx)].video_id),'text':str(rows.iloc[int(idx)].text),'counterfactual_text':counter_text,'counterfactual_source_uid':donor_uid,'raw_frame_count':None if pd.isna(raw_count) else int(raw_count),'resampled_frame_count':TMAX,'resampling_policy':'uniform_linear_48_endpoints_included' if not pd.isna(raw_count) else 'uniform_linear_48_endpoints_included; original_count_unavailable_in_v2_cache','canonicalization_anchor_audit':canonicalization_by_original_index[int(kept_original_indices[int(idx)])],'semantic_retrieval_source_uid':retrieval_uid[j],'reference':{'path':'references/' + slug + '.npz','pose_key':'pose','confidence_key':'confidence'},'predictions':{'true_text':'predictions/' + arm_name + '/' + slug + '_true.npy','shuffled_text':'predictions/' + arm_name + '/' + slug + '_shuffled.npy','zero_pose':'baselines/zero_pose.npy','train_frame_mean':'baselines/train_frame_mean.npy','semantic_retrieval':'baselines/' + slug + '_semantic_retrieval.npy'}})
     true_metrics=export_metrics(true_all,reference_all,confidence_all)
     shuffled_metrics=export_metrics(shuffled_all,reference_all,confidence_all)
     mean_text_delta=np.mean(np.abs(true_all-shuffled_all),axis=(1,2,3))
@@ -743,7 +809,7 @@ for arm_name, run in runs.items():
     all_metrics['arms'][arm_name]={'config':config,'best_epoch':run['best_epoch'],'best_internal_selection_score':run['best_internal_selection_score'],'best_internal_position':run['best_internal_position'],'best_internal_velocity':run['best_internal_velocity'],'best_internal_motion_ratio_by_group':best_history['early_motion_ratio_by_group'],'gpus_used':run['gpus_used'],'seconds':run['seconds'],'true_text':true_metrics,'shuffled_text':shuffled_metrics,'true_vs_shuffled_mean_abs_delta':{'median':float(np.median(mean_text_delta)),'mean':float(np.mean(mean_text_delta)),'per_uid':{sample_records[j]['uid']:float(mean_text_delta[j]) for j in range(len(sample_records))}},'text_sensitivity_gain_vs_shuffled_group_balanced_mse':float(shuffled_metrics['group_balanced_normalized_mse']-true_metrics['group_balanced_normalized_mse'])}
     checkpoint={'format':'Hackcessible iSign V3 compact body+hands','arm':arm_name,'config':config,'state_dict':state,'normalizer_mean':normalizer_mean,'normalizer_std':normalizer_std,'normalizer_fit_uid_sha256':normalizer_fit_uid_sha256,'point_indices':POINT_INDICES,'time_steps':TMAX,'topology':topology,'vocab':vocab if mode=='random' else None,'frozen_text_encoder':MINILM_NAME if mode=='minilm' else None,'license':'iSign CC-BY-NC-SA-4.0; research/non-commercial use only'}
     torch.save(checkpoint,EXPORT_ROOT / 'checkpoints' / (arm_name + '.pt'))
-    manifest={'schema_version':1,'dataset':'Exploration-Lab/iSign v1.1','model_arm':arm_name,'evaluation_status':'development_evidence_not_final_test; the V2 outer holdout was inspected across candidate arms','selected_for_follow_up':arm_name==selected_arm,'selection_metric':'group-balanced normalized position MSE + 0.05 x group-balanced normalized velocity MSE on text-group internal validation','objective':{'group_weights':{'body':0.20,'left_hand':0.40,'right_hand':0.40},'velocity_coefficient':VELOCITY_WEIGHT,'training_velocity_coefficient':config['velocity_weight'],'confidence':'point confidence clipped to [0,1]; velocity confidence is the minimum adjacent-frame confidence','normalization':'train-only per-point/per-axis z-score fit on training_uids_used'},'training_uids_used':training_uids_used,'early_stop_uids':early_stop_uids,'split':{'strategy':'V2 seed 17 video-disjoint selection; exact normalized-caption overlap removed from gradient fit; internal early-stop split by caption groups','group_field':'source_video_id','train':outer_train_records,'validation':outer_val_records,'training_uids_used':training_uids_used,'early_stop_uids':early_stop_uids,'caption_overlap_removed_uids':[str(rows.iloc[int(i)].uid) for i in caption_overlap_ix]},'fixed_unseen_set':{'seed':SEED,'count':len(fixed_uids),'selection_rule':'sha256_rank_by_uid','uids':fixed_uids},'topology':topology,'normalizer':{'path':'normalizer.npz','mean_key':'mean','std_key':'std','fit_split':'train','fit_uid_sha256':normalizer_fit_uid_sha256,'fit_uid_hash_rule':'sha256(sorted training UIDs joined by newline)'},'coordinate_space':'canonical shoulder-centered pose; scale is 2D nose-to-shoulder-midpoint distance in x/y and is applied to x/y/z; predictions are denormalized canonical values, not z-scores','resampling':all_metrics['resampling'],'samples':sample_records,'metrics_path':'metrics_summary.json','license':'iSign CC-BY-NC-SA-4.0; research/non-commercial use only'}
+    manifest={'schema_version':1,'dataset':'Exploration-Lab/iSign v1.1','model_arm':arm_name,'evaluation_status':'development_evidence_not_final_test; the V2 outer holdout was inspected across candidate arms','selected_for_follow_up':arm_name==selected_arm,'selection_metric':'group-balanced normalized position MSE + 0.05 x group-balanced normalized velocity MSE on text-group internal validation','objective':{'group_weights':{'body':0.20,'left_hand':0.40,'right_hand':0.40},'velocity_coefficient':VELOCITY_WEIGHT,'training_velocity_coefficient':config['velocity_weight'],'confidence':'point confidence clipped to [0,1]; velocity confidence is the minimum adjacent-frame confidence','normalization':'train-only per-point/per-axis z-score fit on training_uids_used'},'training_uids_used':training_uids_used,'early_stop_uids':early_stop_uids,'split':{'strategy':'V2 seed 17 video-disjoint selection over the original 2,046 cache rows; one unusable pose excluded within its original partition; exact normalized-caption overlap removed from gradient fit; internal early-stop split by caption groups','group_field':'source_video_id','original_train':original_train_records,'original_validation':original_val_records,'train':outer_train_records,'validation':outer_val_records,'canonicalization_exclusions':canonicalization_exclusions,'canonicalization_exclusion_counts_by_original_split':exclusion_counts_by_side,'training_uids_used':training_uids_used,'early_stop_uids':early_stop_uids,'caption_overlap_removed_uids':[str(rows.iloc[int(i)].uid) for i in caption_overlap_ix]},'canonicalization':{'policy':'nose and both shoulders must be finite, have confidence >= 0.15, and define a nondegenerate 2D x/y scale; interpolate center and log-scale only when at least two valid anchors exist; no fallback anchor modes; exclude irrecoverable clips within their frozen original partition','threshold':MIN_ANCHOR_CONF,'resampled_frame_count':TMAX,'exclusion_count':len(canonicalization_exclusions),'exclusion_counts_by_original_split':exclusion_counts_by_side,'exclusions':canonicalization_exclusions},'fixed_unseen_set':{'seed':SEED,'count':len(fixed_uids),'selection_rule':'sha256_rank_by_uid','selection_universe_count':len(validation_universe_uids),'selection_universe_uid_sha256':validation_universe_sha256,'uids':fixed_uids},'topology':topology,'normalizer':{'path':'normalizer.npz','mean_key':'mean','std_key':'std','fit_split':'train','fit_uid_sha256':normalizer_fit_uid_sha256,'fit_uid_hash_rule':'sha256(sorted training UIDs joined by newline)'},'coordinate_space':'canonical shoulder-centered pose; scale is 2D nose-to-shoulder-midpoint distance in x/y and is applied to x/y/z; predictions are denormalized canonical values, not z-scores','resampling':all_metrics['resampling'],'samples':sample_records,'metrics_path':'metrics_summary.json','license':'iSign CC-BY-NC-SA-4.0; research/non-commercial use only'}
     (EXPORT_ROOT / ('manifest_' + arm_name + '.json')).write_text(json.dumps(manifest,indent=2))
     del model, model_core; gc.collect(); torch.cuda.empty_cache()
     print(arm_name, '| internal best epoch', run['best_epoch'], '| true group-balanced MSE', round(true_metrics['group_balanced_normalized_mse'],5), '| shuffled', round(shuffled_metrics['group_balanced_normalized_mse'],5), '| text delta', round(float(np.mean(mean_text_delta)),5))
@@ -753,7 +819,16 @@ tiny_src=Path('/kaggle/working/isl_v3_tiny_overfit.npz')
 tiny_json_src=Path('/kaggle/working/isl_v3_tiny_overfit.json')
 if tiny_src.exists(): shutil.copy2(tiny_src,EXPORT_ROOT/'diagnostics'/'tiny_overfit.npz')
 if tiny_json_src.exists(): shutil.copy2(tiny_json_src,EXPORT_ROOT/'diagnostics'/'tiny_overfit.json')
-(EXPORT_ROOT / 'README.txt').write_text('V3 outputs contain canonicalized body and hands only (75 points; 48 frames). Face mesh and nonmanual facial grammar are not modeled. Predictions are denormalized canonical coordinates. The 2,046 usable videos reproduce the V2 seed-17 video split. The 12 SHA-ranked fixed unseen UIDs are a subset of the full 205 held-out videos. Motion and coordinate scores do not demonstrate sign intelligibility; have an ISL-fluent signer review rendered outputs. Dataset license: CC-BY-NC-SA-4.0, research/non-commercial use only.\n')
+readme_text = (
+    'V3 outputs contain canonicalized body and hands only (75 points; 48 frames). '
+    'Face mesh and nonmanual facial grammar are not modeled. Predictions are denormalized canonical coordinates. '
+    f'The {len(rows)} usable videos retain their original membership in the V2 seed-17 partition after '
+    f'excluding {len(canonicalization_exclusions)} irrecoverable pose record(s); the frozen original cache roster had {len(original_rows)} videos. '
+    f'The {len(fixed_uids)} SHA-ranked fixed unseen UIDs are a subset of the {len(val_ix)} effective held-out videos. '
+    'Motion and coordinate scores do not demonstrate sign intelligibility; have an ISL-fluent signer review rendered outputs. '
+    'Dataset license: CC-BY-NC-SA-4.0, research/non-commercial use only.\n'
+)
+(EXPORT_ROOT / 'README.txt').write_text(readme_text)
 archive_path=shutil.make_archive('/kaggle/working/hackcessible_isl_v3_artifacts','zip',root_dir=EXPORT_ROOT)
 print('V3 artifacts:',archive_path,'| bytes:',Path(archive_path).stat().st_size)
 print('Selected by internal validation:',selected_arm,'| all held-out rows scored:',len(val_ix),'| fixed qualitative set:',len(fixed_uids))
